@@ -151,12 +151,12 @@ return view.extend({
 						btn.textContent = _('Backing up...');
 						L.resolveDefault(callLuciZerotierSync(), {}).then(function(res) {
 							if (res && res.code === 0) {
-								ui.addNotification(null, E('p', _('Runtime state backed up to persistent storage')), 'info');
+								ui.addTimeLimitedNotification(null, E('p', _('Runtime state backed up to persistent storage')), 5000, 'info');
 							} else {
-								ui.addNotification(null, E('p', _('Backup failed') + (res && res.stderr ? ': ' + res.stderr : '')), 'warning');
+								ui.addTimeLimitedNotification(null, E('p', _('Backup failed') + (res && res.stderr ? ': ' + res.stderr : '')), 10000, 'warning');
 							}
 						}).catch(function() {
-							ui.addNotification(null, E('p', _('Backup request failed')), 'warning');
+							ui.addTimeLimitedNotification(null, E('p', _('Backup request failed')), 10000, 'warning');
 						}).finally(function() {
 							btn.disabled = false;
 							btn.textContent = _('Backup Now');
@@ -303,13 +303,13 @@ return view.extend({
 			if (reloadResult && reloadResult.code === 0) {
 				var natValue = uci.get('zerotier', 'global', 'nat') || '0';
 				var natMsg = natValue === '1' ? _('Auto NAT: Enabled') : _('Auto NAT: Disabled');
-				ui.addNotification(null, E('p', natMsg), 'info');
+				ui.addTimeLimitedNotification(null, E('p', natMsg), 5000, 'info');
 			} else {
 				var errorMsg = reloadResult && reloadResult.stderr ? reloadResult.stderr : _('Unknown error');
-				ui.addNotification(null, E('p', _('Service reload failed: ') + errorMsg), 'warning');
+				ui.addTimeLimitedNotification(null, E('p', _('Service reload failed: ') + errorMsg), 10000, 'warning');
 			}
 		}).catch(function(error) {
-			ui.addNotification(null, E('p', _('Failed to reload service, please run manually: /etc/init.d/luci-zerotier reload')), 'warning');
+			ui.addTimeLimitedNotification(null, E('p', _('Failed to reload service, please run manually: /etc/init.d/luci-zerotier reload')), 10000, 'warning');
 		});
 	},
 
