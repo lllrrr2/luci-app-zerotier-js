@@ -1,0 +1,18 @@
+#!/bin/sh
+
+# When a ZeroTier device appears or disappears, converge the proto=none
+# interface sections and the firewall zone network list onto the networks
+# the daemon currently has joined (/etc/init.d/luci-zerotier sync).
+# Debounced: device events can arrive in bursts around daemon (re)starts,
+# so serialize through a lock and give the daemon a moment to settle.
+
+[ "$ACTION" = "add" ] || [ "$ACTION" = "remove" ] || exit 0
+case "$DEVICENAME" in zt??*) ;; *) exit 0 ;; esac
+
+(
+	flock -n 9 || exit 0
+	sleep 1
+	/etc/init.d/luci-zerotier sync >/dev/null 2>&1
+) 9>/var/run/luci-zerotier-hotplug.lock &
+
+exit 0
