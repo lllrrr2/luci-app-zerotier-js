@@ -19,17 +19,12 @@ fi
 # only reads /usr/share/ucitrack/*.json, and `uci add` fails on systems where
 # /etc/config/ucitrack does not exist.
 
-# NOTE on firewall integration (r29+): the zerotier zone matches networks,
-# not devices. Each joined network gets a proto=none interface section
-# (zerotier_<nwid>) maintained by /etc/init.d/luci-zerotier sync (run at
-# service start and from the net hotplug hook on zt* device changes). The
-# pre-r29 'zt+' device glob is gone: LuCI's zone widgets only render zone
-# *networks* (a device-only zone shows as "(empty)" in the port-forward
-# source-zone picker) and its DeviceSelect flags the glob as a non-existent
-# device, dropping it from the zone on the next save. Nothing needs to be
-# re-run on firewall reloads; the old include registration is still cleaned
-# up below (including the pre-r22 legacy name collision where it was
-# registered as `firewall.zerotier` type=include).
+# r23 removed the firewall include entirely: the zone now matches devices via
+# the 'zt+' glob, which fw4 renders as an nftables wildcard — nothing needs to
+# be re-run on firewall reloads. (The old include restarted this service, which
+# re-entered fw4's locked section and deadlocked; see README r23 changelog.)
+# Clean up its registration here, including the pre-r22 legacy name collision
+# where the include was registered as `firewall.zerotier` (type=include).
 # Only commit when something was actually deleted — every firewall commit
 # triggers an asynchronous fw4 re-render.
 _fw_changed=0
