@@ -6,6 +6,11 @@ STOP=98
 PROG=/etc/init.d/zerotier
 FW4_LOCK=/var/run/fw4.lock
 
+EXTRA_COMMANDS="sync"
+EXTRA_HELP="	sync	Re-sync the firewall zone device list from the
+	currently present ZeroTier interfaces (also driven by
+	hotplug on zt* device add/remove)"
+
 get_config() {
 	config_get_bool enabled $1 enabled 0
 	config_get_bool nat $1 nat 0
@@ -60,14 +65,54 @@ any_rules_present() {
 	return 1
 }
 
+# Zone membership design (r31): the zone lists the EXPLICIT ZeroTier
+# device names present on the system, enumerated straight from the kernel
+# (/sys/class/net/zt*) — no zerotier-cli dependency (its port file can go
+# missing after service restarts), no netifd involvement (r29 proved that
+# netifd claiming zerotier-managed devices flushes the daemon-assigned
+# IPv4 on 24.10 — do not reintroduce that). The pre-r23 design already
+# used explicit devices but updated them from a firewall include with a
+# 20s readiness wait, which re-entered fw4's lock and deadlocked; the
+# update trigger is now the net hotplug hook instead (fires exactly when
+# a zt device appears or vanishes — no waiting, no include).
+#
+# Trade-off vs the r23 'zt+' glob, kept as documented residue: with real
+# device names LuCI's zone editor shows them and saves preserve them (a
+# glob gets flagged "Absent Interface" and was manually "fixed" away on
+# production boxes). The fw4 glob semantics are partially retained in the
+# matching below — absent devices are simply dropped from the list until
+# they reappear (fw4 would skip them anyway).
+
+# Enumerate the ZeroTier interfaces currently present in the kernel.
+zt_devices() {
+	local d
+	for d in /sys/class/net/zt*; do
+		[ -e "$d" ] && basename "$d"
+	done
+}
+
+# Parse the zone's device list out of `uci show` output. List options are
+# packed onto a single line as device='v1' 'v2' — split the quoted values
+# apart (r29's outage was rooted in parsing this wrong).
+zone_devices() {
+	uci -q show firewall.zerotier 2>/dev/null \
+		| sed -n "s/^firewall\.zerotier\.device='\(.*\)'\$/\1/p" \
+		| tr "'" '\n' \
+		| sed '/^[[:space:]]*$/d; s/^[[:space:]]*//; s/[[:space:]]*$//'
+}
+
 rules_present() {
 	[ "$(uci -q get firewall.zerotier)" = "zone" ] || return 1
 	[ "$(uci -q get firewall.zerotier.name)" = "zerotier" ] || return 1
-	[ "$(uci -q get firewall.zerotier.device)" = "zt+" ] || return 1
 	[ "$(uci -q get firewall.zerotier_lan)" = "forwarding" ] || return 1
 	[ "$(uci -q get firewall.lan_zerotier)" = "forwarding" ] || return 1
 	[ "$(uci -q get firewall.zerotier_wan)" = "forwarding" ] || return 1
 	return 0
+}
+
+state_ok() {
+	rules_present || return 1
+	[ "$(zt_devices | sort)" = "$(zone_devices | sort)" ]
 }
 
 # NOTE on transaction structure: every "uci commit firewall" fires procd's
@@ -85,39 +130,58 @@ rules_present() {
 #      complete state (eventual consistency), and the committed state itself
 #      is guaranteed intact by the verify-retry loop.
 
-# Device matching uses the 'zt+' glob: fw4 renders it as the nftables
-# wildcard iifname/oifname "zt*", which matches current AND future
-# ZeroTier devices (verified on fw4-2024.12.18). This eliminates the
-# old zerotier-cli device enumeration and the 20s readiness wait loop:
-# the rules are correct no matter how long the daemon needs to bring
-# interfaces up (controller authorization can be slow on cold starts),
-# and devices of newly joined networks are covered automatically.
-write_rules() {
-	# zerotier -> lan: 让 zerotier 客户端访问局域网
-	# lan -> zerotier: 让局域网设备通过 zerotier 互访
-	# zerotier -> wan: 让 zerotier 客户端通过本机 WAN 上网（网关模式）
-	uci -q batch <<-'EOF'
-		delete firewall.zerotier
-		set firewall.zerotier=zone
-		set firewall.zerotier.name='zerotier'
-		set firewall.zerotier.input='ACCEPT'
-		set firewall.zerotier.output='ACCEPT'
-		set firewall.zerotier.forward='ACCEPT'
-		set firewall.zerotier.masq='1'
-		set firewall.zerotier.device='zt+'
-		delete firewall.zerotier_lan
-		set firewall.zerotier_lan=forwarding
-		set firewall.zerotier_lan.src='zerotier'
-		set firewall.zerotier_lan.dest='lan'
-		delete firewall.lan_zerotier
-		set firewall.lan_zerotier=forwarding
-		set firewall.lan_zerotier.src='lan'
-		set firewall.lan_zerotier.dest='zerotier'
-		delete firewall.zerotier_wan
-		set firewall.zerotier_wan=forwarding
-		set firewall.zerotier_wan.src='zerotier'
-		set firewall.zerotier_wan.dest='wan'
-	EOF
+# Apply the desired state in ONE uci transaction: zone (with the current
+# explicit device list) and forwardings are committed together, verified,
+# and retried. The fw4 reload only happens after the committed state is
+# complete (never a half-applied zone — that severs management access,
+# see the r29 incident notes).
+apply_state() {
+	if state_ok; then
+		log "ZeroTier firewall state already in sync, nothing to do"
+		return 0
+	fi
+	local attempt dev batch
+	for attempt in 1 2 3; do
+		batch="delete firewall.zerotier
+set firewall.zerotier=zone
+set firewall.zerotier.name='zerotier'
+set firewall.zerotier.input='ACCEPT'
+set firewall.zerotier.output='ACCEPT'
+set firewall.zerotier.forward='ACCEPT'
+set firewall.zerotier.masq='1'
+"
+		for dev in $(zt_devices); do
+			batch="${batch}add_list firewall.zerotier.device='$dev'
+"
+		done
+		# zerotier -> lan: 让 zerotier 客户端访问局域网
+		# lan -> zerotier: 让局域网设备通过 zerotier 互访
+		# zerotier -> wan: 让 zerotier 客户端通过本机 WAN 上网（网关模式）
+		batch="${batch}delete firewall.zerotier_lan
+set firewall.zerotier_lan=forwarding
+set firewall.zerotier_lan.src='zerotier'
+set firewall.zerotier_lan.dest='lan'
+delete firewall.lan_zerotier
+set firewall.lan_zerotier=forwarding
+set firewall.lan_zerotier.src='lan'
+set firewall.lan_zerotier.dest='zerotier'
+delete firewall.zerotier_wan
+set firewall.zerotier_wan=forwarding
+set firewall.zerotier_wan.src='zerotier'
+set firewall.zerotier_wan.dest='wan'
+"
+		printf '%s' "$batch" | uci -q batch
+		uci -q commit firewall
+		if state_ok; then
+			fw_reload
+			log "ZeroTier firewall zone applied ($(zt_devices | wc -l) devices: $(zt_devices | tr '\n' ' '))"
+			return 0
+		fi
+		log "uci transaction incomplete (attempt $attempt), retrying..."
+		sleep 1
+	done
+	log "ERROR: failed to apply ZeroTier firewall state after 3 attempts"
+	return 1
 }
 
 delete_rules() {
@@ -129,26 +193,6 @@ delete_rules() {
 	EOF
 }
 
-add_rules() {
-	if rules_present; then
-		log "Firewall rules for ZeroTier already in place, nothing to do"
-		return 0
-	fi
-	local attempt
-	for attempt in 1 2 3; do
-		write_rules
-		uci commit firewall
-		if rules_present; then
-			fw_reload
-			log "Added uci firewall rules for ZeroTier (device glob zt+)"
-			return 0
-		fi
-		log "uci transaction incomplete (attempt $attempt), retrying..."
-		sleep 1
-	done
-	log "ERROR: failed to write firewall rules after 3 attempts"
-	return 1
-}
 
 remove_rules() {
 	local attempt
@@ -186,13 +230,25 @@ start() {
 	[ "${enabled:-0}" -eq 0 ] && { remove_rules; log "Service disabled in config."; return 0; }
 	[ "${nat:-0}" -eq 0 ] && { remove_rules; log "NAT disabled in config."; return 0; }
 
-	# The rules match the zt* device glob, so they are harmless while the
-	# daemon is down and effective the moment its interfaces appear. There
-	# is no need to gate rule creation on daemon/interface readiness — warn
-	# only, and install the rules unconditionally.
+	# The zone lists the currently present devices, so there is no need to
+	# gate rule creation on daemon/interface readiness — the hotplug hook
+	# re-syncs the list the moment a zt device appears. Warn only, and
+	# install the rules unconditionally.
 	$PROG running 2>/dev/null || log "Warning: zerotier service is not running; installing rules anyway"
 
-	add_rules
+	apply_state
+}
+
+# Hotplug/manual entrypoint: converge the zone device list onto the
+# currently present ZeroTier interfaces (idempotent).
+sync() {
+	config_load zerotier
+	config_foreach get_config zerotier
+
+	[ "${enabled:-0}" -eq 0 ] && { remove_rules; log "Service disabled in config."; return 0; }
+	[ "${nat:-0}" -eq 0 ] && { remove_rules; log "NAT disabled in config."; return 0; }
+
+	apply_state
 }
 
 # rc.common's default reload() is "restart" (stop+start): stop() runs the
